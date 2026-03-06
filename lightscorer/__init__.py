@@ -1,0 +1,2 @@
+"""LightScorer package."""
+
