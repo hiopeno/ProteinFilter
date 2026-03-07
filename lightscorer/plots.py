@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -85,3 +86,40 @@ def plot_misclassified_heatmaps(
         plt.tight_layout()
         plt.savefig(output_dir / f"misclassified_{i}.png", dpi=180)
         plt.close()
+
+
+def export_test_protein_images(
+    x_test: np.ndarray,
+    y_test: np.ndarray,
+    good_output_dir: Path,
+    bad_output_dir: Path,
+    prefix: str = "test",
+    max_per_class: Optional[int] = None,
+) -> dict[str, int]:
+    good_output_dir.mkdir(parents=True, exist_ok=True)
+    bad_output_dir.mkdir(parents=True, exist_ok=True)
+
+    good_indices = np.where(y_test == 1)[0]
+    bad_indices = np.where(y_test == 0)[0]
+    if max_per_class is not None:
+        n = max(0, int(max_per_class))
+        good_indices = good_indices[:n]
+        bad_indices = bad_indices[:n]
+
+    for i, idx in enumerate(good_indices):
+        plt.figure(figsize=(4, 4))
+        plt.imshow(x_test[int(idx)], cmap="viridis", aspect="equal")
+        plt.axis("off")
+        plt.tight_layout(pad=0)
+        plt.savefig(good_output_dir / f"{prefix}_good_{i:05d}.png", dpi=180, bbox_inches="tight", pad_inches=0)
+        plt.close()
+
+    for i, idx in enumerate(bad_indices):
+        plt.figure(figsize=(4, 4))
+        plt.imshow(x_test[int(idx)], cmap="viridis", aspect="equal")
+        plt.axis("off")
+        plt.tight_layout(pad=0)
+        plt.savefig(bad_output_dir / f"{prefix}_bad_{i:05d}.png", dpi=180, bbox_inches="tight", pad_inches=0)
+        plt.close()
+
+    return {"good": int(len(good_indices)), "bad": int(len(bad_indices))}

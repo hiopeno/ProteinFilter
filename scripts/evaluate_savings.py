@@ -16,7 +16,7 @@ from lightscorer.savings import simulate_savings_curve
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--predictions", type=Path, required=True)
-    parser.add_argument("--score-column", type=str, default="score_resnet18")
+    parser.add_argument("--score-column", type=str, default="score_simple_cnn")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--n-candidates", type=int, default=10000)
     parser.add_argument("--af2-seconds", type=float, default=18.0)

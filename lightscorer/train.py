@@ -3,46 +3,44 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import random
-from typing import Dict, Tuple
+import time
+from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import average_precision_score, roc_auc_score
 from torch.utils.data import DataLoader, Dataset
 
-from lightscorer.metrics import evaluate_binary_metrics
-from lightscorer.models import SimpleCNN, build_resnet18_single_channel
+from lightscorer.cli_log import info, key_values
+from lightscorer.models import ImprovedCNN, SimpleCNN
 
 
 @dataclass
 class TrainConfig:
     output_dir: Path
-    model_name: str = "resnet18"
+    model_name: str = "simple_cnn"
     lr: float = 1e-3
     batch_size: int = 64
     epochs: int = 5
-    device: str = "cpu"
-    precision_floor: float = 0.5
+    device: str = "auto"
     seed: int = 42
     deterministic: bool = True
-
-
-def train_logreg_baseline(
-    x_train: np.ndarray, y_train: np.ndarray, seed: int = 42
-) -> LogisticRegression:
-    model = LogisticRegression(max_iter=1000, n_jobs=1, random_state=seed)
-    model.fit(x_train.reshape(len(x_train), -1), y_train.astype(int))
-    return model
+    verbose: bool = True
+    log_interval_steps: int = 0
+    # 早停：连续 patience 个 epoch 无提升则停止，0 表示禁用
+    early_stop_patience: int = 0
+    # 早停监控指标：auc（越大越好）或 loss（越小越好）
+    early_stop_metric: str = "auc"
 
 
 def _build_torch_model(name: str) -> nn.Module:
     if name == "simple_cnn":
         return SimpleCNN()
-    if name == "resnet18":
-        return build_resnet18_single_channel()
-    raise ValueError(f"Unknown model: {name}")
+    if name == "improved_cnn":
+        return ImprovedCNN()
+    raise ValueError(f"Unknown model: {name}. Supported: simple_cnn, improved_cnn")
 
 
 class _NumpyBinaryDataset(Dataset):
@@ -58,6 +56,31 @@ class _NumpyBinaryDataset(Dataset):
         fx = torch.from_numpy(self.x[idx]).to(torch.float32).unsqueeze(0)
         fy = torch.tensor(self.y[idx], dtype=torch.float32)
         return fx, fy
+
+
+def _compute_val_loss(
+    model: nn.Module,
+    x_val: np.ndarray,
+    y_val: np.ndarray,
+    device: torch.device,
+    batch_size: int,
+    loss_fn: nn.Module,
+) -> float:
+    model.eval()
+    loss_sum = 0.0
+    n = 0
+    with torch.no_grad():
+        for start in range(0, len(x_val), batch_size):
+            end = min(start + batch_size, len(x_val))
+            bx = torch.from_numpy(x_val[start:end]).to(torch.float32).unsqueeze(1).to(device)
+            by = torch.from_numpy(y_val[start:end]).to(torch.float32).to(device)
+            logits = model(bx)
+            if logits.ndim > 1:
+                logits = logits.squeeze(-1)
+            loss = loss_fn(logits, by)
+            loss_sum += float(loss) * (end - start)
+            n += end - start
+    return loss_sum / max(n, 1)
 
 
 def _predict_torch_scores(
@@ -93,8 +116,29 @@ def _set_global_seed(seed: int, deterministic: bool) -> None:
             torch.backends.cudnn.benchmark = False
 
 
-def train_torch_model(x_train: np.ndarray, y_train: np.ndarray, config: TrainConfig) -> nn.Module:
-    device = torch.device(config.device)
+def _resolve_device(device_name: str) -> torch.device:
+    name = device_name.lower().strip()
+    if name == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if name == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "device=cuda 但当前环境不可用 CUDA。请安装 CUDA 版 PyTorch，或改用 --device cpu。"
+            )
+        return torch.device("cuda")
+    if name == "cpu":
+        return torch.device("cpu")
+    raise ValueError("device must be one of: auto, cpu, cuda")
+
+
+def train_torch_model(
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    config: TrainConfig,
+    x_val: Optional[np.ndarray] = None,
+    y_val: Optional[np.ndarray] = None,
+) -> nn.Module:
+    device = _resolve_device(config.device)
     _set_global_seed(config.seed, deterministic=config.deterministic)
     model = _build_torch_model(config.model_name).to(device)
     loss_fn = nn.BCEWithLogitsLoss()
@@ -107,9 +151,34 @@ def train_torch_model(x_train: np.ndarray, y_train: np.ndarray, config: TrainCon
         train_ds, batch_size=config.batch_size, shuffle=True, generator=loader_generator
     )
 
-    model.train()
-    for _ in range(config.epochs):
-        for bx, by in loader:
+    if config.verbose:
+        key_values(
+            "训练运行信息",
+            {
+                "实际设备": str(device),
+                "epoch数": config.epochs,
+                "batch_size": config.batch_size,
+                "训练步数/epoch": len(loader),
+                "学习率": config.lr,
+                "早停patience": config.early_stop_patience if config.early_stop_patience > 0 else "禁用",
+                "早停指标": config.early_stop_metric if config.early_stop_patience > 0 else "-",
+            },
+        )
+
+    metric_name = config.early_stop_metric.lower().strip()
+    if metric_name not in ("auc", "loss"):
+        raise ValueError(f"early_stop_metric must be 'auc' or 'loss', got: {config.early_stop_metric}")
+    higher_is_better = metric_name == "auc"
+    best_val = float("-inf") if higher_is_better else float("inf")
+    best_model_state: Optional[dict] = None
+    epochs_no_improve = 0
+
+    for epoch_idx in range(config.epochs):
+        model.train()
+        epoch_start = time.perf_counter()
+        loss_sum = 0.0
+        loss_count = 0
+        for step_idx, (bx, by) in enumerate(loader, start=1):
             bx = bx.to(device)
             by = by.to(device)
             optim.zero_grad()
@@ -119,10 +188,72 @@ def train_torch_model(x_train: np.ndarray, y_train: np.ndarray, config: TrainCon
             loss = loss_fn(logits, by)
             loss.backward()
             optim.step()
+            loss_value = float(loss.detach().cpu().item())
+            loss_sum += loss_value
+            loss_count += 1
+
+            if config.verbose and config.log_interval_steps > 0 and (step_idx % config.log_interval_steps == 0):
+                info(
+                    f"epoch {epoch_idx + 1}/{config.epochs} step {step_idx}/{len(loader)} "
+                    f"loss={loss_value:.6f}"
+                )
+
+        # 每个 epoch 结束后，给出可观察的训练信号（loss + val AUC/PR-AUC）。
+        train_loss_mean = loss_sum / max(loss_count, 1)
+        epoch_seconds = time.perf_counter() - epoch_start
+        msg = (
+            f"epoch {epoch_idx + 1}/{config.epochs} done "
+            f"train_loss={train_loss_mean:.6f} "
+            f"time={epoch_seconds:.1f}s "
+            f"lr={optim.param_groups[0]['lr']:.2e}"
+        )
+        if x_val is not None and y_val is not None and len(y_val) > 0:
+            val_score = _predict_torch_scores(model, x_val, device=device, batch_size=config.batch_size)
+            val_metric = _score_quality(y_val, val_score)
+            msg += f" val_auc={val_metric['auc']:.4f} val_pr_auc={val_metric['pr_auc']:.4f}"
+            val_auc = val_metric["auc"]
+            val_loss = _compute_val_loss(model, x_val, y_val, device, config.batch_size, loss_fn)
+            msg += f" val_loss={val_loss:.4f}"
+            if config.early_stop_patience > 0:
+                if metric_name == "auc":
+                    current_val = val_auc
+                    valid = not (current_val != current_val)  # 非 NaN
+                else:
+                    current_val = val_loss
+                    valid = True
+                if valid:
+                    improved = (current_val > best_val) if higher_is_better else (current_val < best_val)
+                    if improved:
+                        best_val = current_val
+                        best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                        epochs_no_improve = 0
+                    else:
+                        epochs_no_improve += 1
+        if config.verbose:
+            info(msg)
+        if config.early_stop_patience > 0 and epochs_no_improve >= config.early_stop_patience:
+            if config.verbose and best_model_state is not None:
+                info(f"早停: val_{metric_name} 连续 {config.early_stop_patience} 轮无提升，恢复最佳模型")
+            if best_model_state is not None:
+                model.load_state_dict(best_model_state)
+            break
     return model
 
 
-def train_and_compare(
+def _score_quality(y_true: np.ndarray, y_score: np.ndarray) -> dict[str, float]:
+    y_true = np.asarray(y_true).astype(int)
+    y_score = np.asarray(y_score).astype(float)
+    unique = np.unique(y_true)
+    if unique.size < 2:
+        auc = float("nan")
+        pr_auc = 1.0 if int(unique[0]) == 1 else 0.0
+    else:
+        auc = float(roc_auc_score(y_true, y_score))
+        pr_auc = float(average_precision_score(y_true, y_score))
+    return {"auc": auc, "pr_auc": pr_auc}
+
+
+def train_and_evaluate(
     x_train: np.ndarray,
     y_train: np.ndarray,
     x_val: np.ndarray,
@@ -133,12 +264,8 @@ def train_and_compare(
 ) -> Dict[str, pd.DataFrame]:
     config.output_dir.mkdir(parents=True, exist_ok=True)
 
-    lr_model = train_logreg_baseline(x_train, y_train, seed=config.seed)
-    val_score_lr = lr_model.predict_proba(x_val.reshape(len(x_val), -1))[:, 1]
-    test_score_lr = lr_model.predict_proba(x_test.reshape(len(x_test), -1))[:, 1]
-
-    torch_model = train_torch_model(x_train, y_train, config=config)
-    device = torch.device(config.device)
+    torch_model = train_torch_model(x_train, y_train, config=config, x_val=x_val, y_val=y_val)
+    device = _resolve_device(config.device)
     val_score_torch = _predict_torch_scores(
         torch_model, x_val, device=device, batch_size=config.batch_size
     )
@@ -147,14 +274,11 @@ def train_and_compare(
     )
 
     metric_rows = []
-    for model_name, yv, yt in [
-        ("logreg", val_score_lr, test_score_lr),
-        (config.model_name, val_score_torch, test_score_torch),
-    ]:
-        val_metric = evaluate_binary_metrics(y_val, yv, precision_floor=config.precision_floor)
-        test_metric = evaluate_binary_metrics(y_test, yt, precision_floor=config.precision_floor)
-        metric_rows.append({"model": model_name, "split": "val", **val_metric.as_dict()})
-        metric_rows.append({"model": model_name, "split": "test", **test_metric.as_dict()})
+    for model_name, yv, yt in [(config.model_name, val_score_torch, test_score_torch)]:
+        val_metric = _score_quality(y_val, yv)
+        test_metric = _score_quality(y_test, yt)
+        metric_rows.append({"model": model_name, "split": "val", **val_metric})
+        metric_rows.append({"model": model_name, "split": "test", **test_metric})
 
     metrics_df = pd.DataFrame(metric_rows)
     metrics_df.to_csv(config.output_dir / "metrics.csv", index=False)
@@ -162,9 +286,16 @@ def train_and_compare(
     pred_test = pd.DataFrame(
         {
             "y_true": y_test.astype(int),
-            "score_logreg": test_score_lr,
             f"score_{config.model_name}": test_score_torch,
         }
     )
     pred_test.to_csv(config.output_dir / "predictions_test.csv", index=False)
-    return {"metrics": metrics_df, "predictions_test": pred_test}
+
+    pred_val = pd.DataFrame(
+        {
+            "y_true": y_val.astype(int),
+            f"score_{config.model_name}": val_score_torch,
+        }
+    )
+    pred_val.to_csv(config.output_dir / "predictions_val.csv", index=False)
+    return {"metrics": metrics_df, "predictions_test": pred_test, "predictions_val": pred_val}

@@ -17,7 +17,7 @@ from lightscorer.plots import (
     plot_savings_curve,
 )
 from lightscorer.savings import simulate_savings_curve
-from lightscorer.train import TrainConfig, train_and_compare
+from lightscorer.train import TrainConfig, train_and_evaluate
 
 
 def main() -> None:
@@ -26,21 +26,21 @@ def main() -> None:
     fig_dir = output_dir / "figures"
 
     stage(1, 4, "准备数据并训练")
-    info("正在生成 mock 数据并训练模型...")
+    info("正在生成 mock 数据并拟合分数模型...")
     data = load_mock_data(MockDataConfig())
-    result = train_and_compare(
+    result = train_and_evaluate(
         x_train=data["x_train"],
         y_train=data["y_train"],
         x_val=data["x_val"],
         y_val=data["y_val"],
         x_test=data["x_test"],
         y_test=data["y_test"],
-        config=TrainConfig(output_dir=output_dir, model_name="resnet18", epochs=3),
+        config=TrainConfig(output_dir=output_dir, model_name="simple_cnn", epochs=3),
     )
 
     stage(2, 4, "计算收益曲线")
     pred = result["predictions_test"]
-    score_col = "score_resnet18"
+    score_col = "score_simple_cnn"
     savings = simulate_savings_curve(
         y_score=pred[score_col].to_numpy(),
         thresholds=np.linspace(0.05, 0.95, 19),

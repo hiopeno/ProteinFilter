@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 import sys
 from typing import Optional, Tuple
@@ -21,7 +22,7 @@ from lightscorer.plots import (
     plot_savings_curve,
 )
 from lightscorer.savings import simulate_savings_curve
-from lightscorer.train import TrainConfig, train_and_compare
+from lightscorer.train import TrainConfig, train_and_evaluate
 
 
 def _confusion_at_threshold(y_true: np.ndarray, y_score: np.ndarray, threshold: float) -> dict[str, float]:
@@ -54,6 +55,12 @@ def _confusion_at_threshold(y_true: np.ndarray, y_score: np.ndarray, threshold: 
     }
 
 
+def _format_reject_ratio_1_to_x(good_reject_ratio: float, bad_reject_ratio: float) -> str:
+    if good_reject_ratio <= 0:
+        return "1:infx" if bad_reject_ratio > 0 else "1:0.00x"
+    return f"1:{(bad_reject_ratio / good_reject_ratio):.2f}x"
+
+
 def _build_threshold_report(
     y_true: np.ndarray,
     y_score: np.ndarray,
@@ -77,6 +84,9 @@ def _build_threshold_report(
                 "reject_ratio": m["reject_ratio"],
                 "good_reject_ratio": m["good_reject_ratio"],
                 "bad_reject_ratio": m["bad_reject_ratio"],
+                "good_reject_ratio/bad_reject_ratio(1:x)": _format_reject_ratio_1_to_x(
+                    float(m["good_reject_ratio"]), float(m["bad_reject_ratio"])
+                ),
                 "speedup": float(row.speedup),
                 "hours_saved": float(row.hours_saved),
                 "meets_recall_target": bool(m["recall"] >= recall_target),
@@ -92,6 +102,43 @@ def _build_threshold_report(
     )
     best_working = constrained.iloc[0]
     return report, best_working, best_theoretical
+
+
+def _savings_from_keep_ratio(
+    keep_ratio: float,
+    n_candidates: int,
+    af2_seconds_per_sample: float,
+    lightscorer_ms_per_sample: float,
+) -> dict[str, float]:
+    base_total_seconds = n_candidates * af2_seconds_per_sample
+    ls_total_seconds = n_candidates * (lightscorer_ms_per_sample / 1000.0)
+    af2_after_seconds = n_candidates * keep_ratio * af2_seconds_per_sample
+    total_seconds = ls_total_seconds + af2_after_seconds
+    return {
+        "baseline_hours": base_total_seconds / 3600.0,
+        "pipeline_hours": total_seconds / 3600.0,
+        "hours_saved": (base_total_seconds - total_seconds) / 3600.0,
+        "speedup": base_total_seconds / max(total_seconds, 1e-9),
+    }
+
+
+def _round_sig_float(value: float, sig: int = 3) -> float:
+    if pd.isna(value) or not np.isfinite(value):
+        return value
+    if value == 0:
+        return 0.0
+    digits = sig - int(math.floor(math.log10(abs(float(value))))) - 1
+    return round(float(value), digits)
+
+
+def _round_numeric_sig(df: pd.DataFrame, sig: int = 3) -> pd.DataFrame:
+    out = df.copy()
+    for col in out.columns:
+        if pd.api.types.is_float_dtype(out[col]) or pd.api.types.is_integer_dtype(out[col]):
+            if pd.api.types.is_integer_dtype(out[col]):
+                continue
+            out[col] = out[col].map(lambda x: _round_sig_float(x, sig=sig))
+    return out
 
 
 def _print_split_label_check(manifest) -> None:
@@ -118,10 +165,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split-seed", type=int, default=42)
     parser.add_argument("--split-ratio", type=str, default="0.8,0.1,0.1")
 
-    parser.add_argument("--model-name", type=str, default="simple_cnn")
+    parser.add_argument("--model-name", type=str, default="improved_cnn", choices=["simple_cnn", "improved_cnn"])
     parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--early-stop-patience", type=int, default=0, help="早停: 连续 N 轮无提升则停止，0 表示禁用")
+    parser.add_argument("--early-stop-metric", type=str, default="auc", choices=["auc", "loss"], help="早停监控指标: auc 或 loss")
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
+    parser.add_argument("--log-interval-steps", type=int, default=200)
     parser.add_argument("--matrix-size", type=int, default=128)
     parser.add_argument("--clip-max", type=float, default=30.0)
     parser.add_argument("--max-samples-per-split", type=int, default=1000)
@@ -153,7 +203,10 @@ def main() -> None:
             "output_dir": args.output_dir,
             "model_name": args.model_name,
             "epochs": args.epochs,
+            "early_stop_patience": args.early_stop_patience,
+            "early_stop_metric": args.early_stop_metric,
             "batch_size": args.batch_size,
+            "log_interval_steps": args.log_interval_steps,
             "tm_threshold": args.tm_threshold,
             "split_ratio": split_ratio,
             "split_seed": args.split_seed,
@@ -186,7 +239,7 @@ def main() -> None:
     _print_split_label_check(manifest)
 
     stage(3, 5, "加载特征并训练模型")
-    info("正在提取距离矩阵特征并执行训练/评估...")
+    info("正在提取距离矩阵特征并拟合分数模型...")
     data = load_real_data(
         RealDataConfig(
             manifest_path=manifest_path,
@@ -209,7 +262,7 @@ def main() -> None:
             "x_test": data["x_test"].shape,
         },
     )
-    result = train_and_compare(
+    result = train_and_evaluate(
         x_train=data["x_train"],
         y_train=data["y_train"],
         x_val=data["x_val"],
@@ -222,32 +275,36 @@ def main() -> None:
             epochs=args.epochs,
             batch_size=args.batch_size,
             device=args.device,
-            precision_floor=0.0,
             seed=args.seed,
+            verbose=True,
+            log_interval_steps=args.log_interval_steps,
+            early_stop_patience=args.early_stop_patience,
+            early_stop_metric=args.early_stop_metric,
         ),
     )
-    success("训练与评估完成。")
+    success("模型训练与分数导出完成。")
 
     stage(4, 5, "收益评估与图像生成")
     info("正在计算速度收益并导出图像...")
     pred = result["predictions_test"]
+    pred_val = result["predictions_val"]
     score_col = f"score_{args.model_name}"
-    savings = simulate_savings_curve(
-        y_score=pred[score_col].to_numpy(),
+    savings_val = simulate_savings_curve(
+        y_score=pred_val[score_col].to_numpy(),
         thresholds=np.linspace(0.05, 0.95, 19),
         n_candidates=args.n_candidates,
         af2_seconds_per_sample=args.af2_seconds,
         lightscorer_ms_per_sample=args.ls_ms,
     )
     savings_path = args.output_dir / "savings.csv"
-    savings.to_csv(savings_path, index=False)
+    savings_val.to_csv(savings_path, index=False)
 
     if pred["y_true"].nunique() >= 2:
         info("绘制 ROC/PR 曲线...")
         plot_curves(pred["y_true"].to_numpy(), pred[score_col].to_numpy(), fig_dir, score_col)
     else:
         warn("测试集只有单一类别，已跳过 ROC/PR 曲线绘制。")
-    plot_savings_curve(savings, fig_dir)
+    plot_savings_curve(savings_val, fig_dir)
     try:
         plot_distance_heatmaps(data["x_test"], data["y_test"], fig_dir, prefix="real_test")
     except (ValueError, IndexError):
@@ -268,43 +325,95 @@ def main() -> None:
     success(f"图像目录: {fig_dir}")
 
     threshold_report, best_working, best_theoretical = _build_threshold_report(
-        pred["y_true"].to_numpy(),
-        pred[score_col].to_numpy(),
-        savings=savings,
+        pred_val["y_true"].to_numpy(),
+        pred_val[score_col].to_numpy(),
+        savings=savings_val,
         recall_target=args.recall_target,
     )
     threshold_report_path = args.output_dir / "threshold_report.csv"
-    threshold_report.to_csv(threshold_report_path, index=False)
-    success(f"阈值报告: {threshold_report_path}")
+    threshold_report_export = _round_numeric_sig(threshold_report, sig=3)
+    threshold_report_export.to_csv(threshold_report_path, index=False)
+    success(f"阈值报告(VAL): {threshold_report_path}")
+
+    test_working_path = args.output_dir / "test_working_point.csv"
+    if best_working is None:
+        test_working = pd.DataFrame(
+            [
+                {
+                    "threshold_from_val": np.nan,
+                    "precision_test": np.nan,
+                    "recall_test": np.nan,
+                    "keep_ratio_test": np.nan,
+                    "reject_ratio_test": np.nan,
+                    "good_reject_ratio_test": np.nan,
+                    "bad_reject_ratio_test": np.nan,
+                    "speedup_test": np.nan,
+                    "hours_saved_test": np.nan,
+                }
+            ]
+        )
+    else:
+        working_threshold = float(best_working["threshold"])
+        test_conf = _confusion_at_threshold(
+            pred["y_true"].to_numpy(),
+            pred[score_col].to_numpy(),
+            threshold=working_threshold,
+        )
+        test_savings = _savings_from_keep_ratio(
+            keep_ratio=float(test_conf["keep_ratio"]),
+            n_candidates=args.n_candidates,
+            af2_seconds_per_sample=args.af2_seconds,
+            lightscorer_ms_per_sample=args.ls_ms,
+        )
+        test_working = pd.DataFrame(
+            [
+                {
+                    "threshold_from_val": working_threshold,
+                    "precision_test": float(test_conf["precision"]),
+                    "recall_test": float(test_conf["recall"]),
+                    "keep_ratio_test": float(test_conf["keep_ratio"]),
+                    "reject_ratio_test": float(test_conf["reject_ratio"]),
+                    "good_reject_ratio_test": float(test_conf["good_reject_ratio"]),
+                    "bad_reject_ratio_test": float(test_conf["bad_reject_ratio"]),
+                    "speedup_test": float(test_savings["speedup"]),
+                    "hours_saved_test": float(test_savings["hours_saved"]),
+                }
+            ]
+        )
+    test_working_export = _round_numeric_sig(test_working, sig=3)
+    test_working_export.to_csv(test_working_path, index=False)
+    success(f"固定阈值测试评估: {test_working_path}")
 
     stage(5, 5, "生成 Go/No-Go 结论")
     go_no_go = args.output_dir / "go_no_go.md"
-    if best_working is None:
+    val_working = threshold_report[threshold_report["meets_recall_target"]]
+    if val_working.empty:
         decision = "NO-GO"
         working_text = [
             f"- recall_target: {args.recall_target:.2f}",
-            "- working_point: not_found",
-            "- reason: no threshold satisfies recall target",
+            "- val_working_point: not_found",
+            "- reason: no threshold on VAL satisfies recall target",
         ]
-        warn("未找到满足 Recall 目标的阈值工作点。")
+        warn("VAL 上未找到满足 Recall 目标的阈值工作点。")
         suggest("可降低 recall_target 或提升模型质量后重试。")
     else:
-        working_speedup = float(best_working["speedup"])
-        working_precision = float(best_working["precision"])
-        working_recall = float(best_working["recall"])
-        working_threshold = float(best_working["threshold"])
-        decision = "GO" if working_speedup >= 1.05 else "NO-GO"
+        row = test_working.iloc[0]
+        working_threshold = float(row["threshold_from_val"])
+        working_precision = float(row["precision_test"])
+        working_recall = float(row["recall_test"])
+        working_speedup = float(row["speedup_test"])
+        decision = "GO" if (working_recall >= args.recall_target and working_speedup >= 1.05) else "NO-GO"
         working_text = [
             f"- recall_target: {args.recall_target:.2f}",
-            f"- working_threshold: {working_threshold:.4f}",
-            f"- working_precision: {working_precision:.4f}",
-            f"- working_recall: {working_recall:.4f}",
-            f"- working_keep_ratio: {float(best_working['keep_ratio']):.4f}",
-            f"- working_reject_ratio: {float(best_working['reject_ratio']):.4f}",
-            f"- working_good_reject_ratio: {float(best_working['good_reject_ratio']):.4f}",
-            f"- working_bad_reject_ratio: {float(best_working['bad_reject_ratio']):.4f}",
-            f"- working_speedup: {working_speedup:.4f}",
-            f"- working_hours_saved: {float(best_working['hours_saved']):.4f}",
+            f"- working_threshold(from_val): {working_threshold:.4f}",
+            f"- working_precision(test): {working_precision:.4f}",
+            f"- working_recall(test): {working_recall:.4f}",
+            f"- working_keep_ratio(test): {float(row['keep_ratio_test']):.4f}",
+            f"- working_reject_ratio(test): {float(row['reject_ratio_test']):.4f}",
+            f"- working_good_reject_ratio(test): {float(row['good_reject_ratio_test']):.4f}",
+            f"- working_bad_reject_ratio(test): {float(row['bad_reject_ratio_test']):.4f}",
+            f"- working_speedup(test): {working_speedup:.4f}",
+            f"- working_hours_saved(test): {float(row['hours_saved_test']):.4f}",
         ]
     go_no_go.write_text(
         "\n".join(
@@ -316,14 +425,14 @@ def main() -> None:
                 f"- test_pr_auc: {metric.pr_auc:.4f}",
                 f"- recall_unconstrained: {metric.recall_at_precision:.4f}",
                 *working_text,
-                f"- theoretical_max_speedup_on_curve: {float(best_theoretical['speedup']):.2f}x",
-                f"- theoretical_max_threshold: {float(best_theoretical['threshold']):.4f}",
+                f"- theoretical_max_speedup_on_val_curve: {float(best_theoretical['speedup']):.2f}x",
+                f"- theoretical_max_threshold_on_val: {float(best_theoretical['threshold']):.4f}",
                 f"- manifest_samples: {int(summary['n_samples'])}",
                 f"- manifest_positive_ratio: {summary['positive_ratio']:.4f}",
                 "",
                 "## Notes",
-                "- Main decision is based on constrained working point (Recall target).",
-                "- Theoretical max speedup is reference only and may be non-deployable.",
+                "- Threshold is selected on VAL under recall constraint, then fixed for TEST evaluation.",
+                "- Theoretical max speedup on VAL is reference only and may be non-deployable.",
                 "- Recommend repeating with multiple random seeds and a full-size run.",
             ]
         ),
@@ -335,29 +444,32 @@ def main() -> None:
         {
             "Manifest": manifest_path,
             "Metrics": args.output_dir / "metrics.csv",
+            "Predictions(VAL)": args.output_dir / "predictions_val.csv",
             "Predictions": args.output_dir / "predictions_test.csv",
             "Savings": savings_path,
-            "ThresholdReport": threshold_report_path,
+            "ThresholdReport(VAL)": threshold_report_path,
+            "TestWorkingPoint": test_working_path,
             "Figures": fig_dir,
             "Decision": go_no_go,
             "测试AUC": f"{metric.auc:.4f}",
             "测试PR-AUC": f"{metric.pr_auc:.4f}",
             "Recall@P": f"{metric.recall_at_precision:.4f}",
-            "理论最大加速比(仅参考)": f"{float(best_theoretical['speedup']):.2f}x",
+            "理论最大加速比(VAL,仅参考)": f"{float(best_theoretical['speedup']):.2f}x",
         },
     )
-    if best_working is not None:
+    if not val_working.empty:
+        test_row = test_working.iloc[0]
         key_values(
-            f"业务工作点(Recall>={args.recall_target:.2f})",
+            f"业务工作点(TEST评估, 阈值来自VAL, Recall>={args.recall_target:.2f})",
             {
-                "threshold": f"{float(best_working['threshold']):.4f}",
-                "precision": f"{float(best_working['precision']):.4f}",
-                "recall": f"{float(best_working['recall']):.4f}",
-                "keep_ratio": f"{float(best_working['keep_ratio']):.4f}",
-                "reject_ratio": f"{float(best_working['reject_ratio']):.4f}",
-                "good_reject_ratio(优质拦截,越低越好)": f"{float(best_working['good_reject_ratio']):.4f}",
-                "bad_reject_ratio(劣质拦截,越高越好)": f"{float(best_working['bad_reject_ratio']):.4f}",
-                "speedup": f"{float(best_working['speedup']):.4f}",
+                "threshold(from_val)": f"{float(test_row['threshold_from_val']):.4f}",
+                "precision(test)": f"{float(test_row['precision_test']):.4f}",
+                "recall(test)": f"{float(test_row['recall_test']):.4f}",
+                "keep_ratio(test)": f"{float(test_row['keep_ratio_test']):.4f}",
+                "reject_ratio(test)": f"{float(test_row['reject_ratio_test']):.4f}",
+                "good_reject_ratio(test,优质拦截)": f"{float(test_row['good_reject_ratio_test']):.4f}",
+                "bad_reject_ratio(test,劣质拦截)": f"{float(test_row['bad_reject_ratio_test']):.4f}",
+                "speedup(test)": f"{float(test_row['speedup_test']):.4f}",
             },
         )
     suggest(
