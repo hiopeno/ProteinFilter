@@ -12,8 +12,7 @@ from lightscorer.manifest import ManifestBuildConfig, build_manifest, summarize_
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-root", type=Path, default=None)
-    parser.add_argument("--raw-lmdb-dir", type=Path, default=None)
+    parser.add_argument("--raw-lmdb-dir", type=Path, required=True, help="Raw LMDB 数据目录，如 dataSet_withScore/casp5_to_13/data")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--score-file", type=Path, default=None)
     parser.add_argument("--label-policy", type=str, default="tm_threshold")
@@ -43,7 +42,6 @@ def main() -> None:
         "运行参数",
         {
             "输出路径": args.output,
-            "数据来源(data_root)": args.data_root,
             "数据来源(raw_lmdb_dir)": args.raw_lmdb_dir,
             "标签策略": args.label_policy,
             "TM阈值": args.tm_threshold,
@@ -54,7 +52,6 @@ def main() -> None:
     )
     config = ManifestBuildConfig(
         output_path=args.output,
-        data_root=args.data_root,
         raw_lmdb_dir=args.raw_lmdb_dir,
         score_file=args.score_file,
         label_policy=args.label_policy,

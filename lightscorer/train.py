@@ -14,7 +14,19 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 from torch.utils.data import DataLoader, Dataset
 
 from lightscorer.cli_log import info, key_values
-from lightscorer.models import ImprovedCNN, SimpleCNN
+from lightscorer.models import (
+    ImprovedCNN,
+    ImprovedCNN_GRN,
+    ImprovedCNN_LK_GRN,
+    ImprovedCNN_LargeKernel,
+    ImprovedCNN_PConv,
+    ImprovedCNN_PConv_05,
+    ImprovedCNN_RepVGG,
+    ImprovedCNN_RepVGG_PConv,
+    ImprovedCNN_ShiftwiseConv,
+    ImprovedCNN_ShiftwiseConv_S2,
+    SimpleCNN,
+)
 
 
 @dataclass
@@ -40,7 +52,31 @@ def _build_torch_model(name: str) -> nn.Module:
         return SimpleCNN()
     if name == "improved_cnn":
         return ImprovedCNN()
-    raise ValueError(f"Unknown model: {name}. Supported: simple_cnn, improved_cnn")
+    if name == "improved_cnn_grn":
+        return ImprovedCNN_GRN()
+    if name == "improved_cnn_largekernel":
+        return ImprovedCNN_LargeKernel()
+    if name == "improved_cnn_lk_grn":
+        return ImprovedCNN_LK_GRN()
+    if name == "improved_cnn_repvgg":
+        return ImprovedCNN_RepVGG()
+    if name == "improved_cnn_pconv":
+        return ImprovedCNN_PConv()
+    if name == "improved_cnn_pconv_05":
+        return ImprovedCNN_PConv_05()
+    if name == "improved_cnn_repvgg_pconv":
+        return ImprovedCNN_RepVGG_PConv()
+    if name == "improved_cnn_shiftwise":
+        return ImprovedCNN_ShiftwiseConv()
+    if name == "improved_cnn_shiftwise_s2":
+        return ImprovedCNN_ShiftwiseConv_S2()
+    raise ValueError(
+        f"Unknown model: {name}. Supported: simple_cnn, improved_cnn, "
+        "improved_cnn_grn, improved_cnn_largekernel, improved_cnn_lk_grn, "
+        "improved_cnn_repvgg, improved_cnn_pconv, improved_cnn_pconv_05, "
+        "improved_cnn_repvgg_pconv, improved_cnn_shiftwise, "
+        "improved_cnn_shiftwise_s2"
+    )
 
 
 class _NumpyBinaryDataset(Dataset):
@@ -137,7 +173,7 @@ def train_torch_model(
     config: TrainConfig,
     x_val: Optional[np.ndarray] = None,
     y_val: Optional[np.ndarray] = None,
-) -> nn.Module:
+) -> tuple[nn.Module, float]:
     device = _resolve_device(config.device)
     _set_global_seed(config.seed, deterministic=config.deterministic)
     model = _build_torch_model(config.model_name).to(device)
@@ -173,6 +209,7 @@ def train_torch_model(
     best_model_state: Optional[dict] = None
     epochs_no_improve = 0
 
+    train_start = time.perf_counter()
     for epoch_idx in range(config.epochs):
         model.train()
         epoch_start = time.perf_counter()
@@ -237,7 +274,10 @@ def train_torch_model(
             if best_model_state is not None:
                 model.load_state_dict(best_model_state)
             break
-    return model
+    training_seconds = time.perf_counter() - train_start
+    if config.verbose:
+        info(f"训练总耗时: {training_seconds:.1f}s ({training_seconds / 60:.2f}min)")
+    return model, training_seconds
 
 
 def _score_quality(y_true: np.ndarray, y_score: np.ndarray) -> dict[str, float]:
@@ -264,7 +304,9 @@ def train_and_evaluate(
 ) -> Dict[str, pd.DataFrame]:
     config.output_dir.mkdir(parents=True, exist_ok=True)
 
-    torch_model = train_torch_model(x_train, y_train, config=config, x_val=x_val, y_val=y_val)
+    torch_model, training_seconds = train_torch_model(
+        x_train, y_train, config=config, x_val=x_val, y_val=y_val
+    )
     device = _resolve_device(config.device)
     val_score_torch = _predict_torch_scores(
         torch_model, x_val, device=device, batch_size=config.batch_size
@@ -283,6 +325,18 @@ def train_and_evaluate(
     metrics_df = pd.DataFrame(metric_rows)
     metrics_df.to_csv(config.output_dir / "metrics.csv", index=False)
 
+    # 记录训练时间，便于消融实验对比
+    training_info = pd.DataFrame(
+        [
+            {
+                "model": config.model_name,
+                "training_seconds": round(training_seconds, 2),
+                "training_time": f"{int(training_seconds // 60)}m {training_seconds % 60:.1f}s",
+            }
+        ]
+    )
+    training_info.to_csv(config.output_dir / "training_info.csv", index=False)
+
     pred_test = pd.DataFrame(
         {
             "y_true": y_test.astype(int),
@@ -298,4 +352,9 @@ def train_and_evaluate(
         }
     )
     pred_val.to_csv(config.output_dir / "predictions_val.csv", index=False)
-    return {"metrics": metrics_df, "predictions_test": pred_test, "predictions_val": pred_val}
+    return {
+        "metrics": metrics_df,
+        "predictions_test": pred_test,
+        "predictions_val": pred_val,
+        "training_info": training_info,
+    }

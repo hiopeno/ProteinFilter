@@ -14,26 +14,13 @@ import pandas as pd
 @dataclass
 class ManifestBuildConfig:
     output_path: Path
-    data_root: Optional[Path] = None
-    raw_lmdb_dir: Optional[Path] = None
+    raw_lmdb_dir: Path
     score_file: Optional[Path] = None
     tm_threshold: float = 0.5
     label_policy: str = "tm_threshold"
     split_seed: int = 42
     split_ratio: tuple[float, float, float] = (0.8, 0.1, 0.1)
     max_entries: Optional[int] = None
-
-
-def _read_split_targets(path: Path, split: str) -> pd.DataFrame:
-    rows = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            target_id, decoy_id = [x.strip() for x in line.split(",", maxsplit=1)]
-            rows.append({"split": split, "target_id": target_id, "decoy_id": decoy_id})
-    return pd.DataFrame(rows)
 
 
 def _read_scores(score_file: Path) -> pd.DataFrame:
@@ -186,24 +173,14 @@ def summarize_manifest(manifest: pd.DataFrame) -> dict[str, float]:
 
 
 def build_manifest(config: ManifestBuildConfig) -> pd.DataFrame:
-    if config.raw_lmdb_dir is not None:
-        manifest = _read_raw_lmdb_entries(
-            config.raw_lmdb_dir, max_entries=config.max_entries
-        )
-        manifest["split"] = _split_by_target(
-            manifest, split_seed=config.split_seed, split_ratio=config.split_ratio
-        )
-        frame_by_split = [manifest[manifest["split"] == s] for s in ("train", "val", "test")]
-        _assert_no_target_leakage(frame_by_split)
-    elif config.data_root is not None:
-        split_dir = config.data_root / "targets"
-        train = _read_split_targets(split_dir / "train.txt", "train")
-        val = _read_split_targets(split_dir / "val.txt", "val")
-        test = _read_split_targets(split_dir / "test.txt", "test")
-        _assert_no_target_leakage([train, val, test])
-        manifest = pd.concat([train, val, test], ignore_index=True)
-    else:
-        raise ValueError("Either data_root or raw_lmdb_dir must be provided")
+    manifest = _read_raw_lmdb_entries(
+        config.raw_lmdb_dir, max_entries=config.max_entries
+    )
+    manifest["split"] = _split_by_target(
+        manifest, split_seed=config.split_seed, split_ratio=config.split_ratio
+    )
+    frame_by_split = [manifest[manifest["split"] == s] for s in ("train", "val", "test")]
+    _assert_no_target_leakage(frame_by_split)
 
     if config.score_file is not None:
         scores = _read_scores(config.score_file)
